@@ -1,4 +1,10 @@
+#if defined(LC_VIDEO_RECEIVE_BATCH) && defined(__linux__)
+#define _GNU_SOURCE 1
+#endif
 #include "Limelight-internal.h"
+#if defined(LC_VIDEO_RECEIVE_BATCH) && defined(__linux__)
+#include "VideoReceiveBatch.h"
+#endif
 
 #define FIRST_FRAME_MAX 1500
 #define FIRST_FRAME_TIMEOUT_SEC 10
@@ -91,6 +97,10 @@ static void VideoReceiveThreadProc(void* context) {
     bool useSelect;
     int waitingForVideoMs;
     bool encrypted;
+#if defined(LC_VIDEO_RECEIVE_BATCH) && defined(__linux__)
+    VIDEO_RECEIVE_BATCH batch = {0};
+    bool batched;
+#endif
 
     encrypted = !!(EncryptionFeaturesEnabled & SS_ENC_VIDEO);
     decryptedSize = StreamConfig.packetSize + MAX_RTP_HEADER_SIZE;
@@ -107,6 +117,15 @@ static void VideoReceiveThreadProc(void* context) {
         // SO_RCVTIMEO timeout set for recv()
         useSelect = false;
     }
+
+#if defined(LC_VIDEO_RECEIVE_BATCH) && defined(__linux__)
+    batched = !encrypted && !useSelect &&
+              (VideoCallbacks.capabilities & CAPABILITY_DIRECT_SUBMIT);
+    if (batched) {
+        initializeVideoReceiveBatch(&batch, receiveSize);
+        Limelog("Video receive batching enabled (max %d packets)\n", VIDEO_RECEIVE_BATCH_SIZE);
+    }
+#endif
 
     // Allocate a staging buffer to use for each received packet
     if (encrypted) {
@@ -125,7 +144,11 @@ static void VideoReceiveThreadProc(void* context) {
     while (!PltIsThreadInterrupted(&receiveThread)) {
         PRTP_PACKET packet;
 
-        if (buffer == NULL) {
+        if (buffer == NULL
+#if defined(LC_VIDEO_RECEIVE_BATCH) && defined(__linux__)
+            && !batched
+#endif
+        ) {
             buffer = (char*)malloc(bufferSize);
             if (buffer == NULL) {
                 Limelog("Video Receive: malloc() failed\n");
@@ -134,10 +157,28 @@ static void VideoReceiveThreadProc(void* context) {
             }
         }
 
-        err = recvUdpSocket(rtpSocket,
-                            encrypted ? encryptedBuffer : buffer,
-                            receiveSize,
-                            useSelect);
+#if defined(LC_VIDEO_RECEIVE_BATCH) && defined(__linux__)
+        if (batched) {
+            err = receiveVideoPacketBatch(&batch, rtpSocket, bufferSize, &buffer);
+            if (err == VIDEO_RECEIVE_BATCH_TRUNCATED) {
+                continue;
+            }
+            if (err < 0 && (errno == ENOSYS || errno == EOPNOTSUPP)) {
+                // Keep the original receiver usable on kernels without recvmmsg.
+                destroyVideoReceiveBatch(&batch);
+                batched = false;
+                Limelog("Video receive batching unavailable; using scalar receive\n");
+                continue;
+            }
+        }
+        else
+#endif
+        {
+            err = recvUdpSocket(rtpSocket,
+                                encrypted ? encryptedBuffer : buffer,
+                                receiveSize,
+                                useSelect);
+        }
         if (err < 0) {
             Limelog("Video Receive: recvUdpSocket() failed: %d\n", (int)LastSocketError());
             ListenerCallbacks.connectionTerminated(LastSocketFail());
@@ -241,6 +282,9 @@ static void VideoReceiveThreadProc(void* context) {
         free(buffer);
     }
 
+#if defined(LC_VIDEO_RECEIVE_BATCH) && defined(__linux__)
+    destroyVideoReceiveBatch(&batch);
+#endif
     if (encryptedBuffer != NULL) {
         free(encryptedBuffer);
     }
